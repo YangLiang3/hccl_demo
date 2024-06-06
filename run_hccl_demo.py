@@ -13,6 +13,7 @@ Args
     --size              - str, Data size in units of G,M,K,B or no unit (default: 33554432)
     --loop              - int, Number of iterations (must be positive, default: 10)
     --ranks_list        - str, Comma separated list of pairs of ranks for send_recv ranks test only, e.g. 0,8,1,8 (optional, default is to perform regular send_recv test with all ranks)
+    --group             - int, 0 indicates no group as default, 1 indicates group mode
     --test_root         - int, Index of root rank for broadcast and reduce tests
     --csv_path          - str, Path to a file for results output
     --data_type         - str, Data type, float or bfloat16. Default is float
@@ -20,6 +21,7 @@ Args
     --size_range_inc    - int, Test will run on all multiplies by 2^size_range_inc from MIN to MAX (default: 1)
     --data_csv          - Creates 2 csv file for each rank, one for data input and second for data output
     --mpi               - Use MPI for managing execution
+    --mpi_node          - Total number of mpi node
     --clean             - Clear old executable and compile a new one
     --list              - Display a list of available tests
     --doc               - Display detailed help for HCCL demo in a form of docstring
@@ -44,7 +46,6 @@ Env variables - Host affinity settings
     BEST_EFFORT_AFFINITY  - Use best effort process affinity (default 0)
     NUMA_MAPPING_DIR      - Location of numa mapping file used for process affinity'''
 """
-
 import argparse
 import logging as Logger
 import datetime, glob
@@ -63,8 +64,10 @@ class DemoTest:
         self.size_range_inc           = None
         self.loop                     = None
         self.ranks_list               = None
+        self.group                    = None
         self.test_root                = None
         self.mpi                      = None
+        self.mpi_node                 = None
         self.clean                    = None
         self.list_tests               = None
         self.dev_env                  = False
@@ -77,6 +80,7 @@ class DemoTest:
         self.default_affinity_dir     = '/tmp/affinity_topology_output'
         self.cmd_list                 = []
         self.log_level                = Logger.DEBUG
+        self.default_comm_id          = "127.0.0.1:9096"
         self.mpi_args                 = []
         self.ERROR                    = 1
         self.SUCCESS                  = 0
@@ -133,6 +137,8 @@ class DemoTest:
                             help="Test will run from MIN to MAX, units of G,M,K,B or no unit. Default is Bytes, e.g. --size_range 32B 1M")
         parser.add_argument("--size_range_inc", metavar="M", type=int,
                             help="Test will run on all multiplies by 2^size_range_inc from MIN to MAX ", default=1)
+        parser.add_argument("--group", type=int,
+                            help="Multiple Groups Setting", default=0)
         parser.add_argument("--loop", type=int,
                             help="Number of loop iterations", default=10)
         parser.add_argument("--test_root", type=int, default=0,
@@ -144,6 +150,7 @@ class DemoTest:
                             help="Data type, float or bfloat16. Default is float")
         parser.add_argument("--mpi", "-mpi", action="store_true",
                             help="Use MPI for managing execution")
+        parser.add_argument("--mpi_node", "-mpi_node", type=int, default=-1, help="Total numbers of MPI node")
         parser.add_argument("--clean", "-clean", action="store_true",
                             help="Clean previous artifacts including logs, recipe and csv results")
         parser.add_argument("-list", "--list_tests", action="store_true",
@@ -200,6 +207,7 @@ class DemoTest:
                     invalid_arguments.append("nranks")
                 if self.ranks_per_node:
                     invalid_arguments.append("ranks_per_node")
+
                 if invalid_arguments:
                     self.exit_demo(f'[validate_arguments] the following command line arguments cannot be used in MPI mode: {invalid_arguments}')
             if not self.test in self.test_list:
@@ -213,6 +221,15 @@ class DemoTest:
         except Exception as e:
             self.log_error(f'[validate_arguments] {e}' ,exception=True)
             raise Exception(e)
+
+    def parse_mpi_node_args(self):
+        if '--host' in self.mpi_args:
+            host_index = self.mpi_args.index('--host')
+            host_arg = self.mpi_args[host_index + 1]
+            hosts = host_arg.split(',')
+            return len(hosts)
+        else:
+            return 0
 
     def prepare_demo(self):
         '''The following method is used to prepare the required information
@@ -248,6 +265,9 @@ class DemoTest:
            Please notice that different commands are used for running
            HCCL demo in pure and mpi modes.'''
         try:
+            comm_id = os.getenv('HCCL_COMM_ID', self.default_comm_id)
+            comm_info = str(comm_id).split(":", 1)
+            port_num = int(comm_info[1])
             if self.mpi:
                 self.log_info("HCCL demo runs in MPI mode", 'green')
                 cmd = self.get_command()
@@ -260,20 +280,29 @@ class DemoTest:
                     self.set_env('HWLOC_HIDE_ERRORS','1')
                     for ignore_arg in self.ignore_mpi_errors_list:
                         mpi_cmd += f' {ignore_arg}'
+                    self.log_debug(f"HCCL demo mpi command line: {mpi_cmd}")
+                    self.cmd_list.append(mpi_cmd)
                 self.log_debug(f"HCCL demo mpi command line: {mpi_cmd}")
                 self.cmd_list.append(mpi_cmd)
             else:
-                self.log_info("HCCL demo runs in pure mode", 'green')
-                for i in range(self.number_of_processes):
-                    cmd = self.get_command(i)
-                    self.cmd_list.append(cmd)
+                if self.group !=0:
+                    self.log_info("HCCL demo runs in pure mode", 'green')
+                    for i in range(self.number_of_processes):
+                        cmd = self.get_command(i, comm_info[0], port_num)
+                        self.cmd_list.append(cmd)
+                else:
+                    self.log_info("HCCL demo runs in pure mode", 'green')
+                    for i in range(self.number_of_processes):
+                        cmd = self.get_command(i)
+                        self.cmd_list.append(cmd)
+
                 self.log_debug("HCCL demo command line:")
                 self.log_debug('\n'.join(self.cmd_list))
         except Exception as e:
             self.log_error(f'[prepare_command] {e}', exception=True)
             raise Exception(e)
 
-    def get_command(self, id=0):
+    def get_command(self, id=0, addr=None, port_num=0):
         '''The following method is used in order to determine HCCL demo command
            and translate class attributes to the corresponding env variables.'''
         try:
@@ -281,6 +310,7 @@ class DemoTest:
             numa_output_path = os.getenv('NUMA_MAPPING_DIR', self.default_affinity_dir)
             cmd_args.append("HCCL_DEMO_TEST="          + str(self.test))
             cmd_args.append("HCCL_DATA_TYPE="          + str(self.data_type))
+            cmd_args.append("HCCL_GROUP_MODE="          + str(self.group))
             if self.size_range:
                 cmd_args.append("HCCL_SIZE_RANGE_MIN=" + str(self.size_range[0]))
                 cmd_args.append("HCCL_SIZE_RANGE_MAX=" + str(self.size_range[1]))
@@ -310,7 +340,18 @@ class DemoTest:
                 cmd_args.append("HCCL_RANK=" + str(rank))
                 cmd_args.append("HCCL_NRANKS=" + str(self.nranks))
                 cmd_args.append("HCCL_BOX_SIZE=" + str(self.ranks_per_node))
-                cmd_args.append(self.demo_exe)
+                if port_num != 0:
+                    cmd_args.append("ID=" + str(self.node_id))
+                    cmd_args.append("HCCL_RANK=" + str(self.node_id))
+                    cmd_args.append("HCCL_NRANKS=" + str(self.nranks/self.ranks_per_node))
+                    cmd_args.append("HCCL_BOX_SIZE=" + str(1))
+                    cmd_args.append("HCCL_COMM_ID=" + str(addr) + ":" + str(port_num + id))
+                    cmd_args.append("HCCL_SPLIT_INDEX=" + str(id))
+            else:
+                self.mpi_node = self.parse_mpi_node_args()
+                cmd_args.append("HCCL_MPI_NODE=" + str(self.mpi_node))
+
+            cmd_args.append(self.demo_exe)
             cmd = " ".join(cmd_args)
             return cmd
         except Exception as e:

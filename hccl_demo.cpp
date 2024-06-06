@@ -441,6 +441,48 @@ inline void ParseCustomCommEnv(string rank_list, vector<int>& parsed_rank_list)
     return;
 }
 
+int get_split_index()
+{
+    static bool is_cached = false;
+    static auto test_index = -1;
+    if (!is_cached)
+    {
+	char* env_value = getenv("HCCL_SPLIT_INDEX");
+	test_index       = (env_value != nullptr) ? atoi(env_value) : test_index;
+	is_cached       = true;
+    }
+
+    return test_index;
+}
+
+int get_group_mode()
+{
+    static bool is_cached = false;
+    static auto group = 0;
+    if (!is_cached)
+    {
+	char* env_value = getenv("HCCL_GROUP_MODE");
+	group       = (env_value != nullptr) ? atoi(env_value) : group;
+	is_cached       = true;
+    }
+    return group;
+}
+
+#if MPI_ENABLED
+int get_mpi_node()
+{
+    static bool is_cached = false;
+    static auto test_node_amount = -1;
+    if (!is_cached)
+    {
+	char* env_value = getenv("HCCL_MPI_NODE");
+	test_node_amount = (env_value != nullptr) ? atoi(env_value) : test_node_amount;
+	is_cached       = true;
+    }
+    return test_node_amount;
+}
+#endif
+
 bool buildCustomComm(hccl_demo_data* demo_data)
 {
     string rank_list = get_demo_custom_comm();
@@ -1970,8 +2012,23 @@ int main()
         demo_data.hccl_data_type = get_demo_hccl_data_type();
         demo_data.str_data_type  = get_demo_str_data_type();
         demo_data.hccl_rank      = get_hccl_rank();
-        demo_data.mpi_root_rank  = 0;
-        bool bf16_convert        = (demo_data.hccl_data_type == hcclBfloat16);
+	demo_data.mpi_root_rank  = 0;
+	bool bf16_convert        = (demo_data.hccl_data_type == hcclBfloat16);
+
+	char hostname[1024];
+	gethostname(hostname, 1024);
+	log() << "Hostname : " <<  hostname;
+	log() << " nranks : " << demo_data.nranks << ", hccl_rank : " << demo_data.hccl_rank << std::endl;
+
+#if MPI_ENABLED
+	if (get_group_mode()) {
+		demo_data.nranks         = get_mpi_node();
+		demo_data.hccl_rank      = get_hccl_rank()/get_demo_box_size();
+
+		log() << "grouping the ranks .... " << hostname << " nranks : " << demo_data.nranks;
+		log() << ", hccl_rank : " << demo_data.hccl_rank << " device_module_id : " << get_hccl_rank() % get_demo_box_size() << std::endl;
+	}
+#endif
 
         if (buildCustomComm(&demo_data) == false)
         {
@@ -1988,8 +2045,22 @@ int main()
         // Initialize Synapse API context
         CHECK_SYNAPSE_STATUS(synInitialize());
         // Acquire device
-        synModuleId device_module_id = get_hccl_rank() % get_demo_box_size();
-        synStatus   rc               = synDeviceAcquireByModuleId(&demo_data.device_handle, device_module_id);
+	synModuleId device_module_id;
+#if MPI_ENABLED
+	if (get_group_mode())
+		device_module_id = get_hccl_rank()%(get_nranks() / get_mpi_node());
+	else
+		device_module_id = get_hccl_rank() % get_demo_box_size();
+#else
+        device_module_id = get_hccl_rank() % get_demo_box_size();
+#endif
+	if (get_group_mode()) {
+		if (get_split_index() >= 0) {
+			device_module_id = get_split_index();
+		}
+	}
+
+	synStatus   rc               = synDeviceAcquireByModuleId(&demo_data.device_handle, device_module_id);
         if (rc != synSuccess)
         {
             device_module_id = INVALID_MODULE_ID;
@@ -2008,18 +2079,43 @@ int main()
         CHECK_SYNAPSE_STATUS(synStreamCreateGeneric(&demo_data.host_to_device_stream, demo_data.device_handle, 0));
 
         // Generate unique id
+#if MPI_ENABLED
+	if (get_group_mode()) {
+		hcclUniqueId* unique_ids {};
+		unique_ids = new hcclUniqueId[get_nranks() / get_mpi_node()];
+
+		if (is_master_rank_unique_id(demo_data, get_hccl_rank()))
+		{
+			for (int i = 0; i < get_nranks() / get_mpi_node(); i++)
+			{
+				CHECK_HCCL_STATUS(hcclGetUniqueId(&unique_ids[i]));
+			}
+		}
+		CHECK_MPI_STATUS(MPI_Bcast(unique_ids, sizeof(hcclUniqueId) * get_nranks() / get_mpi_node(),
+					MPI_BYTE, demo_data.mpi_root_rank, MPI_COMM_WORLD));
+
+                // Create new HCCL communicator
+		CHECK_HCCL_STATUS(hcclCommInitRank(&demo_data.hccl_comm, demo_data.nranks, unique_ids[device_module_id], demo_data.hccl_rank));
+		log() << "debug: host " << hostname << " comm/dev: " << device_module_id;
+		log() << "   rank: " << demo_data.hccl_rank << " of " << demo_data.nranks << endl;
+	}
+	else {
+		hcclUniqueId unique_id {};
+		if (is_master_rank_unique_id(demo_data, get_hccl_rank()))
+		{
+			CHECK_HCCL_STATUS(hcclGetUniqueId(&unique_id));
+		}
+		CHECK_MPI_STATUS(MPI_Bcast(&unique_id, sizeof(unique_id), MPI_BYTE, demo_data.mpi_root_rank, MPI_COMM_WORLD));
+		CHECK_HCCL_STATUS(hcclCommInitRank(&demo_data.hccl_comm, demo_data.nranks, unique_id, demo_data.hccl_rank));
+	}
+#else
         hcclUniqueId unique_id {};
         if (is_master_rank_unique_id(demo_data, get_hccl_rank()))
         {
             CHECK_HCCL_STATUS(hcclGetUniqueId(&unique_id));
         }
-
-#if MPI_ENABLED
-        CHECK_MPI_STATUS(MPI_Bcast(&unique_id, sizeof(unique_id), MPI_BYTE, demo_data.mpi_root_rank, MPI_COMM_WORLD));
-#endif  // MPI_ENABLED
-
-        // Create new HCCL communicator
-        CHECK_HCCL_STATUS(hcclCommInitRank(&demo_data.hccl_comm, demo_data.nranks, unique_id, demo_data.hccl_rank));
+	CHECK_HCCL_STATUS(hcclCommInitRank(&demo_data.hccl_comm, demo_data.nranks, unique_id, demo_data.hccl_rank));
+#endif
 
         if (bf16_convert)
         {
