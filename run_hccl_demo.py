@@ -549,7 +549,7 @@ class DemoTest:
             for default_arg in self.default_mpi_arg_list:
                 if default_arg not in mpi_cmd:
                     if default_arg == '--mca btl_tcp_if_include':
-                        interface = self.find_interface()
+                        interface = 'eth0'#self.find_interface()
                         mpi_cmd += default_arg.rjust(len(default_arg) + 1) + " " + interface
                         self.log_debug(f'{default_arg} {interface}')
                     else:
