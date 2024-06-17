@@ -408,6 +408,7 @@ class DemoTest:
         '''The following method is used in order to run HCCL demo test in pure mode.
            HCCL demo will invoke as many processes as were requested by the user.'''
         try:
+            self.log_info("YangLiang's code command line:", 'green')
             self.log_info("HCCL demo test command line:", 'green')
             self.log_info('\n\n'.join(self.cmd_list))
             pool = Pool(processes=self.nranks)
