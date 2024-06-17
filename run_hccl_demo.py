@@ -432,6 +432,7 @@ class DemoTest:
     def run_mpi_test(self):
         '''# MPI helper method
            The following method is used in order to run HCCL demo test using MPI.'''
+        self.log_info("YangLiang's code run mpi test command line:", 'green')
         mpi_cmd = self.cmd_list[0]
         mpi_cmd += " hccl_demo"
         self.run_mpi_command(mpi_cmd)
